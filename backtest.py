@@ -58,6 +58,9 @@ def fetch_historical_data(symbol, interval, start_date, end_date):
     data['open_time'] = pd.to_datetime(data['open_time'], unit='ms')
     data['close_time'] = pd.to_datetime(data['close_time'], unit='ms')
     
+    # 인덱스 설정
+    data.set_index('open_time', inplace=True)
+    
     for col in ['open', 'high', 'low', 'close', 'volume']:
         data[col] = data[col].astype(float)
     
@@ -66,20 +69,18 @@ def fetch_historical_data(symbol, interval, start_date, end_date):
 
 # 매매 신호 생성
 def generate_signals(df):
-    signals = pd.DataFrame(index=df.index)
-    signals['price'] = df['close']
-    signals['signal'] = 0  # 0: 중립, 1: 매수, -1: 매도
+    df = df.copy()
+    df['signal'] = 0  # 0: 중립, 1: 매수, -1: 매도
     
     # 매수 신호 (MACD 골든 크로스 + RSI 과매도)
-    buy_signals = (df['macd'] > df['macd_signal']) & (df['macd'].shift(1) <= df['macd_signal'].shift(1)) & (df['rsi'] <= RSI_OVERSOLD)
+    buy_condition = (df['macd'] > df['macd_signal']) & (df['macd'].shift(1) <= df['macd_signal'].shift(1)) & (df['rsi'] <= RSI_OVERSOLD)
+    df.loc[buy_condition, 'signal'] = 1
     
     # 매도 신호 (MACD 데드 크로스 + RSI 과매수)
-    sell_signals = (df['macd'] < df['macd_signal']) & (df['macd'].shift(1) >= df['macd_signal'].shift(1)) & (df['rsi'] >= RSI_OVERBOUGHT)
+    sell_condition = (df['macd'] < df['macd_signal']) & (df['macd'].shift(1) >= df['macd_signal'].shift(1)) & (df['rsi'] >= RSI_OVERBOUGHT)
+    df.loc[sell_condition, 'signal'] = -1
     
-    signals.loc[buy_signals, 'signal'] = 1
-    signals.loc[sell_signals, 'signal'] = -1
-    
-    return signals
+    return df[['close', 'signal']]
 
 # 백테스트 실행
 def run_backtest(signals, initial_balance=10000):
@@ -93,7 +94,7 @@ def run_backtest(signals, initial_balance=10000):
     
     for i in range(len(signals)):
         current_time = signals.index[i]
-        current_price = signals['price'].iloc[i]
+        current_price = signals['close'].iloc[i]
         current_signal = signals['signal'].iloc[i]
         
         # 초기 잔고 기록
@@ -166,7 +167,7 @@ def run_backtest(signals, initial_balance=10000):
                 position = None
         
         # 매일 잔고 기록
-        if i > 0 and current_time.day != signals.index[i-1].day:
+        if i > 0 and current_time.date() != signals.index[i-1].date():
             total_value = balance
             if btc_amount > 0:
                 total_value = balance + (btc_amount * current_price)
@@ -180,7 +181,7 @@ def run_backtest(signals, initial_balance=10000):
     
     # 마지막 포지션 정리
     if position == 'LONG':
-        current_price = signals['price'].iloc[-1]
+        current_price = signals['close'].iloc[-1]
         balance = btc_amount * current_price * 0.99
         change_pct = (current_price - entry_price) / entry_price
         
