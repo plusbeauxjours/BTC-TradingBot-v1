@@ -47,6 +47,11 @@ def calculate_indicators(df):
     df['volume_ma'] = df['volume'].rolling(window=VOLUME_MA_PERIOD).mean()
     df['volume_ratio'] = df['volume'] / df['volume_ma']
     
+    # 추가 지표 계산
+    df['price_change'] = df['close'].pct_change()
+    df['volume_change'] = df['volume'].pct_change()
+    df['avg_volume'] = df['volume'].rolling(window=VOLUME_MA_PERIOD).mean()
+    
     # Trend Analysis
     df['trend'] = (df['ma_fast'] - df['ma_slow']) / df['ma_slow']
     df['trend_strength'] = abs(df['trend'])
@@ -151,82 +156,251 @@ def generate_signals(df, df_trend):
     # 상위 타임프레임 추세 분석
     higher_trend = df_trend['close'] > df_trend['ma_trend']
     higher_trend_strength = abs(df_trend['close'] - df_trend['ma_trend']) / df_trend['ma_trend']
-    strong_higher_trend = higher_trend_strength > MIN_TREND_STRENGTH
     
     # 볼린저 밴드 위치
     df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
     
-    # 연속 상승/하락 캔들 확인
-    df['consec_up'] = (df['close'] > df['open']).astype(int).rolling(window=3).sum()
-    df['consec_down'] = (df['close'] < df['open']).astype(int).rolling(window=3).sum()
+    # 캔들스틱 패턴 분석
+    df['bullish_engulfing'] = False
+    df['bearish_engulfing'] = False
+    df['bullish_hammer'] = False
+    df['bearish_shooting_star'] = False
+    df['bullish_doji'] = False
+    df['bearish_doji'] = False
     
-    # 추가 지표 계산
-    df['price_change'] = df['close'].pct_change()
-    df['volume_change'] = df['volume'].pct_change()
-    df['avg_volume'] = df['volume'].rolling(window=VOLUME_MA_PERIOD).mean()
+    for i in range(1, len(df)):
+        # 불리시 인걸핑 패턴 - 완화된 기준
+        if (df['close'].iloc[i-1] < df['open'].iloc[i-1] and  # 이전 캔들이 음봉
+            df['close'].iloc[i] > df['open'].iloc[i] and      # 현재 캔들이 양봉
+            df['close'].iloc[i] > df['close'].iloc[i-1]):     # 종가가 이전 종가보다 높음
+            df.loc[df.index[i], 'bullish_engulfing'] = True
+            
+        # 베어리시 인걸핑 패턴 - 완화된 기준
+        if (df['close'].iloc[i-1] > df['open'].iloc[i-1] and  # 이전 캔들이 양봉
+            df['close'].iloc[i] < df['open'].iloc[i] and      # 현재 캔들이 음봉
+            df['close'].iloc[i] < df['close'].iloc[i-1]):     # 종가가 이전 종가보다 낮음
+            df.loc[df.index[i], 'bearish_engulfing'] = True
+            
+        # 불리시 해머 - 완화된 기준
+        body = abs(df['close'].iloc[i] - df['open'].iloc[i])
+        lower_wick = min(df['open'].iloc[i], df['close'].iloc[i]) - df['low'].iloc[i]
+        upper_wick = df['high'].iloc[i] - max(df['open'].iloc[i], df['close'].iloc[i])
+        
+        if (df['close'].iloc[i] > df['open'].iloc[i] and      # 양봉
+            lower_wick >= body * 1.0 and                      # 아래 꼬리가 몸통 이상 (매우 완화)
+            upper_wick < body):                               # 위 꼬리가 몸통보다 작음 (매우 완화)
+            df.loc[df.index[i], 'bullish_hammer'] = True
+            
+        # 베어리시 슈팅스타 - 완화된 기준
+        if (df['close'].iloc[i] < df['open'].iloc[i] and      # 음봉
+            upper_wick >= body * 1.0 and                      # 위 꼬리가 몸통 이상 (매우 완화)
+            lower_wick < body):                               # 아래 꼬리가 몸통보다 작음 (매우 완화)
+            df.loc[df.index[i], 'bearish_shooting_star'] = True
+            
+        # 도지 패턴 추가 (몸통이 작은 캔들)
+        candle_range = df['high'].iloc[i] - df['low'].iloc[i]
+        if candle_range > 0 and body / candle_range < 0.3:  # 몸통이 전체 범위의 30% 미만
+            if df['close'].iloc[i] > df['open'].iloc[i]:  # 양봉 도지
+                df.loc[df.index[i], 'bullish_doji'] = True
+            else:  # 음봉 도지
+                df.loc[df.index[i], 'bearish_doji'] = True
     
-    # 추세 확인
-    df['trend_up'] = df['close'].rolling(window=TREND_CONFIRMATION_PERIOD).apply(lambda x: (x[-1] > x[0]) and all(x[i] >= x[i-1] for i in range(1, len(x))))
-    df['trend_down'] = df['close'].rolling(window=TREND_CONFIRMATION_PERIOD).apply(lambda x: (x[-1] < x[0]) and all(x[i] <= x[i-1] for i in range(1, len(x))))
+    # MACD 교차 분석
+    df['macd_cross_up'] = (df['macd'] > df['macd_signal']) & (df['macd'].shift(1) <= df['macd_signal'].shift(1))
+    df['macd_cross_down'] = (df['macd'] < df['macd_signal']) & (df['macd'].shift(1) >= df['macd_signal'].shift(1))
+    df['macd_trending_up'] = (df['macd'] > df['macd'].shift(1))
+    df['macd_trending_down'] = (df['macd'] < df['macd'].shift(1))
     
-    # 디버깅을 위한 조건 분석
-    df['macd_condition'] = (df['macd'] > df['macd_signal']) & (df['macd'].shift(1) <= df['macd_signal'].shift(1)) & (df['macd'] > MACD_THRESHOLD)
-    df['rsi_condition'] = (df['rsi'] <= RSI_OVERSOLD) & (df['rsi'] > df['rsi'].shift(1))
-    df['bb_condition'] = df['bb_position'] < 0.2  # 볼린저 밴드 조건 강화
+    # RSI 방향성 분석
+    df['rsi_trending_up'] = (df['rsi'] > df['rsi'].shift(1))
+    df['rsi_trending_down'] = (df['rsi'] < df['rsi'].shift(1))
+    
+    # 이동평균선 교차 분석 (추가)
+    df['ma_cross_up'] = (df['ma_fast'] > df['ma_slow']) & (df['ma_fast'].shift(1) <= df['ma_slow'].shift(1))
+    df['ma_cross_down'] = (df['ma_fast'] < df['ma_slow']) & (df['ma_fast'].shift(1) >= df['ma_slow'].shift(1))
+    
+    # 연속 캔들 분석
+    df['consec_up'] = 0
+    df['consec_down'] = 0
+    
+    for i in range(1, len(df)):
+        if df['close'].iloc[i] > df['open'].iloc[i]:  # 양봉
+            df.loc[df.index[i], 'consec_up'] = df['consec_up'].iloc[i-1] + 1
+            df.loc[df.index[i], 'consec_down'] = 0
+        elif df['close'].iloc[i] < df['open'].iloc[i]:  # 음봉
+            df.loc[df.index[i], 'consec_down'] = df['consec_down'].iloc[i-1] + 1
+            df.loc[df.index[i], 'consec_up'] = 0
+    
+    # 매수 신호 조건들
+    df['macd_condition'] = (
+        df['macd_cross_up'] | 
+        ((df['macd'] > df['macd_signal']) & df['macd_trending_up'])
+    )
+    
+    df['rsi_condition'] = (
+        (df['rsi'] <= RSI_OVERSOLD) | 
+        ((df['rsi'] < 45) & df['rsi_trending_up'])
+    )
+    
+    df['bb_condition'] = (
+        (df['bb_position'] < 0.3) | 
+        (df['close'] < df['bb_lower'])
+    )
+    
     df['trend_condition'] = (
-        (df['trend_direction'] == 1) &
-        (df['trend_strength'] > MIN_TREND_STRENGTH) &
-        (df['trend_strength'] < MAX_TREND_STRENGTH) &
-        df['trend_up']  # 추세 확인 추가
+        (df['trend_direction'] == 1) |
+        (df['ma_cross_up']) |
+        (df['close'] > df['ma_fast'])
     )
+    
     df['volume_condition'] = (
-        (df['volume'] > df['avg_volume'] * VOLUME_THRESHOLD) &
-        (df['volume_change'] > MIN_VOLUME_INCREASE) &
-        (df['volume'] > df['volume'].shift(1))  # 연속 거래량 증가 확인
-    )
-    df['volatility_condition'] = (
-        (df['atr'] >= MIN_ATR_THRESHOLD) &
-        (df['atr'] <= MAX_ATR_THRESHOLD) &
-        (df['volatility_state'] == 'normal')  # 정상 변동성 상태에서만 매매
+        (df['volume'] > df['avg_volume']) |
+        (df['volume_change'] > 0)
     )
     
-    # 매수 신호 조건
-    buy_condition = (
-        # 기술적 지표 조건 (AND 연산으로 변경)
-        df['macd_condition'] &
+    df['volatility_condition'] = (df['atr'] > 0)  # 항상 True (제약 조건 제거)
+    
+    # 패턴 조건 (추가된 패턴)
+    df['pattern_condition'] = (
+        df['bullish_engulfing'] | 
+        df['bullish_hammer'] | 
+        df['bullish_doji'] | 
+        (df['consec_up'] >= 1)
+    )
+    
+    # 매수 신호 조건 - 매우 완화된 조건
+    # 다양한 진입 시나리오 구현
+    
+    # 시나리오 1: RSI 과매도 반등
+    buy_scenario_1 = (
         df['rsi_condition'] &
-        df['bb_condition'] &
+        df['rsi_trending_up'] &
+        ((df['close'] > df['ma_fast']) | (df['ma_cross_up']))
+    )
+    
+    # 시나리오 2: MACD 상승 교차
+    buy_scenario_2 = (
+        df['macd_condition'] &
         df['trend_condition'] &
-        df['volume_condition'] &
-        df['volatility_condition'] &
-        # 상위 타임프레임 추세 확인
-        (higher_trend & strong_higher_trend)
+        (df['volume'] > df['volume'].shift(1))
     )
-    df.loc[buy_condition, 'signal'] = 1
     
-    # 매도 신호 조건
-    df['macd_sell_condition'] = (df['macd'] < df['macd_signal']) & (df['macd'].shift(1) >= df['macd_signal'].shift(1)) & (df['macd'] < -MACD_THRESHOLD)
-    df['rsi_sell_condition'] = (df['rsi'] >= RSI_OVERBOUGHT) & (df['rsi'] < df['rsi'].shift(1))
-    df['bb_sell_condition'] = df['bb_position'] > 0.8  # 볼린저 밴드 조건 강화
+    # 시나리오 3: 볼린저 밴드 하단 반등
+    buy_scenario_3 = (
+        ((df['close'] < df['bb_lower']) | (df['bb_position'] < 0.2)) &
+        df['rsi_trending_up'] &
+        (df['close'] > df['close'].shift(1))
+    )
+    
+    # 시나리오 4: 패턴 기반 진입
+    buy_scenario_4 = (
+        df['pattern_condition'] &
+        (df['close'] > df['ma_fast']) &
+        (df['volume'] > df['avg_volume'] * 0.8)
+    )
+    
+    # 시나리오 5: 추세 상승 확인
+    buy_scenario_5 = (
+        (df['close'] > df['ma_trend']) &
+        (df['ma_fast'] > df['ma_fast'].shift(3)) &
+        (df['volume'] > df['volume'].shift(1))
+    )
+    
+    # 종합 매수 조건 (시나리오 중 하나라도 충족)
+    buy_condition = (
+        buy_scenario_1 | 
+        buy_scenario_2 | 
+        buy_scenario_3 | 
+        buy_scenario_4 | 
+        buy_scenario_5
+    )
+    
+    # 상위 타임프레임 필터링 (완화: 상승 추세이거나 횡보장일 때만)
+    higher_timeframe_filter = (higher_trend | (higher_trend_strength < MIN_TREND_STRENGTH))
+    
+    # 최종 매수 신호
+    df.loc[buy_condition & higher_timeframe_filter, 'signal'] = 1
+    
+    # 매도 신호 조건들
+    df['macd_sell_condition'] = (
+        df['macd_cross_down'] | 
+        ((df['macd'] < df['macd_signal']) & df['macd_trending_down'])
+    )
+    
+    df['rsi_sell_condition'] = (
+        (df['rsi'] >= RSI_OVERBOUGHT) | 
+        ((df['rsi'] > 55) & df['rsi_trending_down'])
+    )
+    
+    df['bb_sell_condition'] = (
+        (df['bb_position'] > 0.7) | 
+        (df['close'] > df['bb_upper'])
+    )
+    
     df['trend_sell_condition'] = (
-        (df['trend_direction'] == 0) &
-        (df['trend_strength'] > MIN_TREND_STRENGTH) &
-        (df['trend_strength'] < MAX_TREND_STRENGTH) &
-        df['trend_down']  # 추세 확인 추가
+        (df['trend_direction'] == 0) |
+        (df['ma_cross_down']) |
+        (df['close'] < df['ma_fast'])
     )
     
-    sell_condition = (
-        # 기술적 지표 조건 (AND 연산으로 변경)
-        df['macd_sell_condition'] &
-        df['rsi_sell_condition'] &
-        df['bb_sell_condition'] &
-        df['trend_sell_condition'] &
-        df['volume_condition'] &
-        df['volatility_condition'] &
-        # 상위 타임프레임 추세 확인
-        (~higher_trend & strong_higher_trend)
+    df['pattern_sell_condition'] = (
+        df['bearish_engulfing'] | 
+        df['bearish_shooting_star'] | 
+        df['bearish_doji'] | 
+        (df['consec_down'] >= 1)
     )
-    df.loc[sell_condition, 'signal'] = -1
+    
+    # 매도 신호 다양한 시나리오
+    
+    # 시나리오 1: RSI 과매수 반전
+    sell_scenario_1 = (
+        df['rsi_sell_condition'] &
+        df['rsi_trending_down'] &
+        ((df['close'] < df['ma_fast']) | (df['ma_cross_down']))
+    )
+    
+    # 시나리오 2: MACD 하락 교차
+    sell_scenario_2 = (
+        df['macd_sell_condition'] &
+        df['trend_sell_condition'] &
+        (df['volume'] > df['volume'].shift(1))
+    )
+    
+    # 시나리오 3: 볼린저 밴드 상단 이탈
+    sell_scenario_3 = (
+        ((df['close'] > df['bb_upper']) | (df['bb_position'] > 0.8)) &
+        df['rsi_trending_down'] &
+        (df['close'] < df['close'].shift(1))
+    )
+    
+    # 시나리오 4: 패턴 기반 매도
+    sell_scenario_4 = (
+        df['pattern_sell_condition'] &
+        (df['close'] < df['ma_fast']) &
+        (df['volume'] > df['avg_volume'] * 0.8)
+    )
+    
+    # 시나리오 5: 추세 하락 확인
+    sell_scenario_5 = (
+        (df['close'] < df['ma_trend']) &
+        (df['ma_fast'] < df['ma_fast'].shift(3)) &
+        (df['volume'] > df['volume'].shift(1))
+    )
+    
+    # 종합 매도 조건 (시나리오 중 하나라도 충족)
+    sell_condition = (
+        sell_scenario_1 | 
+        sell_scenario_2 | 
+        sell_scenario_3 | 
+        sell_scenario_4 | 
+        sell_scenario_5
+    )
+    
+    # 상위 타임프레임 필터링 (완화: 하락 추세이거나 횡보장일 때만)
+    higher_timeframe_filter_sell = (~higher_trend | (higher_trend_strength < MIN_TREND_STRENGTH))
+    
+    # 최종 매도 신호
+    df.loc[sell_condition & higher_timeframe_filter_sell, 'signal'] = -1
     
     # 디버깅 정보 출력
     print("\n=== 매매 신호 분석 ===")
@@ -238,6 +412,14 @@ def generate_signals(df, df_trend):
     print(f"추세 조건: {df['trend_condition'].sum()}")
     print(f"거래량 조건: {df['volume_condition'].sum()}")
     print(f"변동성 조건: {df['volatility_condition'].sum()}")
+    print(f"패턴 조건: {df['pattern_condition'].sum()}")
+    
+    print(f"시나리오 1 (RSI 반등): {buy_scenario_1.sum()}")
+    print(f"시나리오 2 (MACD 교차): {buy_scenario_2.sum()}")
+    print(f"시나리오 3 (BB 반등): {buy_scenario_3.sum()}")
+    print(f"시나리오 4 (패턴 기반): {buy_scenario_4.sum()}")
+    print(f"시나리오 5 (추세 확인): {buy_scenario_5.sum()}")
+    
     print(f"최종 매수 신호: {(df['signal'] == 1).sum()}")
     
     print("\n매도 조건 만족 횟수:")
@@ -245,14 +427,32 @@ def generate_signals(df, df_trend):
     print(f"RSI 조건: {df['rsi_sell_condition'].sum()}")
     print(f"볼린저 밴드 조건: {df['bb_sell_condition'].sum()}")
     print(f"추세 조건: {df['trend_sell_condition'].sum()}")
-    print(f"거래량 조건: {df['volume_condition'].sum()}")
-    print(f"변동성 조건: {df['volatility_condition'].sum()}")
+    print(f"패턴 조건: {df['pattern_sell_condition'].sum()}")
+    
+    print(f"시나리오 1 (RSI 반전): {sell_scenario_1.sum()}")
+    print(f"시나리오 2 (MACD 교차): {sell_scenario_2.sum()}")
+    print(f"시나리오 3 (BB 이탈): {sell_scenario_3.sum()}")
+    print(f"시나리오 4 (패턴 기반): {sell_scenario_4.sum()}")
+    print(f"시나리오 5 (추세 확인): {sell_scenario_5.sum()}")
+    
     print(f"최종 매도 신호: {(df['signal'] == -1).sum()}")
+    
+    # 월별 신호 개수 분석 추가
+    df['month'] = df.index.month
+    monthly_signals = df.groupby('month')['signal'].apply(lambda x: (x != 0).sum())
+    print("\n월별 거래 신호 수:")
+    print(monthly_signals)
+    
+    # 월 평균 거래 수 계산
+    months_count = len(monthly_signals)
+    if months_count > 0:
+        avg_trades_per_month = monthly_signals.sum() / months_count
+        print(f"\n월 평균 거래 수: {avg_trades_per_month:.2f}")
     
     return df[['close', 'signal', 'dynamic_stop_loss', 'dynamic_take_profit', 'volatility_state']]
 
 def execute_trade(df, position, entry_price, entry_time, current_price, current_time):
-    """변동성 기반 거래 실행"""
+    """향상된 변동성 기반 거래 실행 및 자금 관리"""
     if position == 0:  # 포지션 없음
         return 0, current_price, current_time
     
@@ -264,30 +464,57 @@ def execute_trade(df, position, entry_price, entry_time, current_price, current_
     # 수익률 계산
     pnl = (current_price - entry_price) / entry_price if position > 0 else (entry_price - current_price) / entry_price
     
+    # 거래 진입 시간 계산
+    holding_time = (current_time - entry_time).total_seconds() / 3600  # 시간 단위
+    
+    # 시간 기반 동적 익절/손절 조정
+    time_factor = min(1.5, max(0.8, 1 + (holding_time / 48)))  # 48시간 후 최대 50% 증가, 최소 20% 감소
+    
+    # 변동성 상태에 따른 추가 조정
+    if current_volatility == 'high':
+        vol_factor = 0.8  # 높은 변동성에서는 더 빨리 익절
+    elif current_volatility == 'low':
+        vol_factor = 1.2  # 낮은 변동성에서는 더 길게 홀딩
+    else:
+        vol_factor = 1.0  # 정상 변동성에서는 기본값
+    
+    # 최종 익절/손절 값 계산
+    adjusted_take_profit = dynamic_take_profit * time_factor * vol_factor
+    adjusted_stop_loss = dynamic_stop_loss * min(1.2, time_factor)  # 손절폭은 너무 넓어지지 않도록 제한
+    
+    # 트레일링 스탑 활성화 기준 (역시 시간에 따라 조정)
+    trailing_activation = TRAILING_STOP_ACTIVATION * (0.8 if holding_time > 24 else 1.0)
+    
     # 변동성 기반 청산 조건
     if position > 0:  # 롱 포지션
         # 손절
-        if pnl <= -dynamic_stop_loss:
+        if pnl <= -adjusted_stop_loss:
+            print(f"손절 실행: {pnl*100:.2f}% (기준: {-adjusted_stop_loss*100:.2f}%)")
             return 0, current_price, current_time
         # 익절
-        if pnl >= dynamic_take_profit:
+        if pnl >= adjusted_take_profit:
+            print(f"익절 실행: {pnl*100:.2f}% (기준: {adjusted_take_profit*100:.2f}%)")
             return 0, current_price, current_time
         # 트레일링 스탑
-        if pnl >= TRAILING_STOP_ACTIVATION:
+        if pnl >= trailing_activation:
             trailing_stop = pnl * TRAILING_STOP_MULTIPLIER
             if pnl <= trailing_stop:
+                print(f"트레일링 스탑 발동: {pnl*100:.2f}% (기준: {trailing_stop*100:.2f}%)")
                 return 0, current_price, current_time
     else:  # 숏 포지션
         # 손절
-        if pnl <= -dynamic_stop_loss:
+        if pnl <= -adjusted_stop_loss:
+            print(f"손절 실행: {pnl*100:.2f}% (기준: {-adjusted_stop_loss*100:.2f}%)")
             return 0, current_price, current_time
         # 익절
-        if pnl >= dynamic_take_profit:
+        if pnl >= adjusted_take_profit:
+            print(f"익절 실행: {pnl*100:.2f}% (기준: {adjusted_take_profit*100:.2f}%)")
             return 0, current_price, current_time
         # 트레일링 스탑
-        if pnl >= TRAILING_STOP_ACTIVATION:
+        if pnl >= trailing_activation:
             trailing_stop = pnl * TRAILING_STOP_MULTIPLIER
             if pnl <= trailing_stop:
+                print(f"트레일링 스탑 발동: {pnl*100:.2f}% (기준: {trailing_stop*100:.2f}%)")
                 return 0, current_price, current_time
     
     return position, entry_price, entry_time

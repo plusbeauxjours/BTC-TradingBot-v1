@@ -53,6 +53,11 @@ def calculate_indicators(df):
     df['volume_ma'] = df['volume'].rolling(window=VOLUME_MA_PERIOD).mean()
     df['volume_ratio'] = df['volume'] / df['volume_ma']
     
+    # Additional calculations for backtest compatibility
+    df['price_change'] = df['close'].pct_change()
+    df['volume_change'] = df['volume'].pct_change()
+    df['avg_volume'] = df['volume'].rolling(window=VOLUME_MA_PERIOD).mean()
+    
     # ATR for volatility
     df['atr'] = calculate_atr(df, ATR_PERIOD)
     
@@ -162,45 +167,129 @@ def calculate_position_size(df, base_size):
     return min(MAX_POSITION_SIZE, base_size * size_multiplier)
 
 def check_signal(df_main, df_trend):
-    """Enhanced signal detection with multi-timeframe analysis"""
+    """Enhanced signal detection with multi-timeframe analysis and pattern recognition"""
+    if len(df_main) < 50 or len(df_trend) < 20:
+        return None  # Not enough data for reliable analysis
+    
     last = df_main.iloc[-1]
     prev = df_main.iloc[-2]
+    prev2 = df_main.iloc[-3]
     
-    # Trend analysis
+    # Get trend analysis
     trend_info = analyze_trend(df_main, df_trend)
     
-    # Base conditions
+    # Get dynamic risk parameters
+    risk_params = calculate_dynamic_risk_params(df_main, trend_info)
+    
+    # Check for excessive volatility
+    if trend_info['is_volatile_market']:
+        return None  # Skip trading in highly volatile markets
+    
+    # Base MACD conditions
     macd_cross_up = (prev['macd'] < prev['macd_signal']) and (last['macd'] > last['macd_signal'])
     macd_cross_down = (prev['macd'] > prev['macd_signal']) and (last['macd'] < last['macd_signal'])
     
-    # Volume confirmation
-    volume_confirmed = last['volume_ratio'] > VOLUME_THRESHOLD
+    # Enhanced MACD conditions
+    macd_trending_up = (last['macd'] > last['macd'].shift(1)) and (last['macd'].shift(1) > last['macd'].shift(2))
+    macd_trending_down = (last['macd'] < last['macd'].shift(1)) and (last['macd'].shift(1) < last['macd'].shift(2))
+    macd_above_threshold = last['macd'] > MACD_THRESHOLD
+    macd_below_threshold = last['macd'] < -MACD_THRESHOLD
     
-    # RSI conditions
+    # Volume confirmation with sustained trend
+    volume_confirmed = (last['volume_ratio'] > VOLUME_THRESHOLD and 
+                        df_main['volume_ratio'].rolling(window=3).mean().iloc[-1] > VOLUME_THRESHOLD)
+    
+    # RSI conditions with extended confirmation
     rsi = last['rsi']
-    rsi_trending_up = rsi > prev['rsi']
-    rsi_trending_down = rsi < prev['rsi']
+    rsi_trending_up = (last['rsi'] > last['rsi'].shift(1)) and (last['rsi'].shift(1) > last['rsi'].shift(2))
+    rsi_trending_down = (last['rsi'] < last['rsi'].shift(1)) and (last['rsi'].shift(1) < last['rsi'].shift(2))
     
     # Price action confirmation
-    price_above_ma = last['close'] > last['ma_fast']
-    price_below_ma = last['close'] < last['ma_fast']
+    price_above_ma_fast = last['close'] > last['ma_fast']
+    price_above_ma_slow = last['close'] > last['ma_slow']
+    price_above_ma_trend = last['close'] > last['ma_trend']
     
-    # Buy signal
-    if (macd_cross_up and 
-        rsi <= RSI_OVERSOLD and 
-        trend_info['trend_aligned'] and
-        trend_info['volume_confirmed'] and
-        price_above_ma and
-        rsi_trending_up):
+    price_below_ma_fast = last['close'] < last['ma_fast']
+    price_below_ma_slow = last['close'] < last['ma_slow']
+    price_below_ma_trend = last['close'] < last['ma_trend']
+    
+    # Higher timeframe confirmation
+    higher_tf_uptrend = df_trend['close'].iloc[-1] > df_trend['ma_trend'].iloc[-1]
+    higher_tf_downtrend = df_trend['close'].iloc[-1] < df_trend['ma_trend'].iloc[-1]
+    
+    # Candlestick patterns for entry confirmation
+    def is_bullish_engulfing():
+        return (prev['close'] < prev['open'] and                    # Previous red candle
+                last['close'] > last['open'] and                    # Current green candle
+                last['open'] < prev['close'] and                    # Open below previous close
+                last['close'] > prev['open'] and                    # Close above previous open
+                (last['close'] - last['open']) > (prev['open'] - prev['close']))  # Larger body
+    
+    def is_bearish_engulfing():
+        return (prev['close'] > prev['open'] and                    # Previous green candle
+                last['close'] < last['open'] and                    # Current red candle
+                last['open'] > prev['close'] and                    # Open above previous close
+                last['close'] < prev['open'] and                    # Close below previous open
+                (last['open'] - last['close']) > (prev['close'] - prev['open']))  # Larger body
+    
+    def is_bullish_hammer():
+        body = abs(last['close'] - last['open'])
+        lower_wick = min(last['open'], last['close']) - last['low']
+        return (last['close'] > last['open'] and                    # Green candle
+                lower_wick >= body * 2 and                          # Long lower wick
+                (last['high'] - max(last['open'], last['close'])) < body * 0.5)  # Short upper wick
+    
+    def is_bearish_shooting_star():
+        body = abs(last['close'] - last['open'])
+        upper_wick = last['high'] - max(last['open'], last['close'])
+        return (last['close'] < last['open'] and                    # Red candle
+                upper_wick >= body * 2 and                          # Long upper wick
+                (min(last['open'], last['close']) - last['low']) < body * 0.5)  # Short lower wick
+    
+    # Bollinger Band position for mean reversion entry and exit
+    bb_position = (last['close'] - last['bb_lower']) / (last['bb_upper'] - last['bb_lower'])
+    oversold_bb = bb_position < 0.2
+    overbought_bb = bb_position > 0.8
+    
+    # Consecutive candles analysis
+    consecutive_up = 0
+    consecutive_down = 0
+    for i in range(1, min(5, len(df_main))):
+        if df_main.iloc[-i]['close'] > df_main.iloc[-i]['open']:
+            consecutive_up += 1
+        else:
+            break
+    
+    for i in range(1, min(5, len(df_main))):
+        if df_main.iloc[-i]['close'] < df_main.iloc[-i]['open']:
+            consecutive_down += 1
+        else:
+            break
+    
+    # Buy signal with stricter conditions
+    if (macd_cross_up and macd_above_threshold and
+        rsi <= RSI_OVERSOLD and rsi_trending_up and
+        trend_info['trend_aligned'] and trend_info['is_uptrend'] and
+        volume_confirmed and
+        trend_info['momentum_aligned'] and
+        price_above_ma_fast and
+        (is_bullish_engulfing() or is_bullish_hammer()) and
+        higher_tf_uptrend and
+        oversold_bb):
+        print("Buy signal confirmed with strong trend alignment!")
         return 'BUY'
     
-    # Sell signal
-    if (macd_cross_down and 
-        rsi >= RSI_OVERBOUGHT and 
-        trend_info['trend_aligned'] and
-        trend_info['volume_confirmed'] and
-        price_below_ma and
-        rsi_trending_down):
+    # Sell signal with stricter conditions
+    if (macd_cross_down and macd_below_threshold and
+        rsi >= RSI_OVERBOUGHT and rsi_trending_down and
+        trend_info['trend_aligned'] and not trend_info['is_uptrend'] and
+        volume_confirmed and
+        trend_info['momentum_aligned'] and
+        price_below_ma_fast and
+        (is_bearish_engulfing() or is_bearish_shooting_star()) and
+        higher_tf_downtrend and
+        overbought_bb):
+        print("Sell signal confirmed with strong trend alignment!")
         return 'SELL'
     
     return None
@@ -224,10 +313,13 @@ class TradingState:
         self.position = None
         self.entry_price = 0
         self.trailing_stop = 0
+        self.dynamic_take_profit = 0
+        self.trailing_activation = TRAILING_STOP_ACTIVATION
         self.daily_trades = 0
         self.daily_pl = 0
         self.last_trade_date = None
         self.open_trades = 0
+        self.trade_start_time = None
     
     def reset_daily_stats(self):
         """Reset daily statistics"""
@@ -236,6 +328,14 @@ class TradingState:
             self.daily_trades = 0
             self.daily_pl = 0
             self.last_trade_date = current_date
+    
+    def calculate_holding_time(self):
+        """Calculate how long the current position has been held"""
+        if self.trade_start_time is None:
+            return 0
+        
+        current_time = datetime.now()
+        return (current_time - self.trade_start_time).total_seconds() / 3600  # in hours
 
 def main():
     global client
@@ -254,6 +354,12 @@ def main():
     
     print('Starting automated trading...')
     state = TradingState()
+    
+    # Keep track of win/loss streaks for adaptive position sizing
+    win_streak = 0
+    loss_streak = 0
+    total_trades = 0
+    winning_trades = 0
     
     while True:
         try:
@@ -274,39 +380,79 @@ def main():
             df_trend = calculate_indicators(df_trend)
             
             current_price = float(df_main['close'].iloc[-1])
+            
+            # Get trend analysis
+            trend_info = analyze_trend(df_main, df_trend)
+            
+            # Skip trading in highly volatile markets
+            if trend_info['is_volatile_market'] and not state.position:
+                print("Market is too volatile. Skipping trading signals.")
+                time.sleep(60)
+                continue
+            
+            # Get dynamic risk parameters based on market conditions
+            risk_params = calculate_dynamic_risk_params(df_main, trend_info)
+            
+            # Check for trading signal
             signal = check_signal(df_main, df_trend)
+            
+            # Calculate win rate-based position sizing
+            win_rate = winning_trades / total_trades if total_trades > 0 else 0.5
+            streak_adjustment = 1.0  # Default
+            
+            # Reduce position size after consecutive losses, increase after wins
+            if loss_streak > 1:
+                streak_adjustment = max(0.5, 1.0 - (loss_streak * 0.1))  # Reduce by 10% per loss, min 50%
+            elif win_streak > 1:
+                streak_adjustment = min(1.2, 1.0 + (win_streak * 0.05))  # Increase by 5% per win, max 120%
+            
+            # Calculate position size based on volatility and win rate
+            base_position_size = POSITION_SIZE * streak_adjustment
+            position_size = calculate_position_size(df_main, base_position_size)
             
             print(f"\nCurrent Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             print(f"Current Price: {current_price}")
             print(f"RSI: {df_main['rsi'].iloc[-1]:.2f}")
             print(f"MACD: {df_main['macd'].iloc[-1]:.2f}")
             print(f"Signal: {df_main['macd_signal'].iloc[-1]:.2f}")
+            print(f"Market Volatility: {'High' if trend_info['is_volatile_market'] else 'Normal'}")
+            print(f"Position Size: {position_size}")
             
             # Position entry logic
             if not state.position and state.daily_trades < MAX_DAILY_TRADES:
-                position_size = calculate_position_size(df_main, POSITION_SIZE)
-                
                 if signal == 'BUY' and state.open_trades < MAX_OPEN_TRADES:
-                    print("Buy signal detected!")
+                    print("Buy signal detected with strong confirmation!")
                     order = execute_order(SIDE_BUY, position_size)
                     if order:
                         state.position = 'LONG'
                         state.entry_price = current_price
-                        state.trailing_stop = current_price * (1 - STOP_LOSS_PCT)
+                        # Use dynamic stop loss based on market conditions
+                        state.trailing_stop = current_price * (1 - risk_params['stop_loss'])
+                        state.dynamic_take_profit = current_price * (1 + risk_params['take_profit'])
+                        state.trailing_activation = risk_params['trailing_activation']
                         state.daily_trades += 1
                         state.open_trades += 1
+                        state.trade_start_time = datetime.now()
                         print(f"Entered LONG position at {state.entry_price}")
+                        print(f"Stop loss: {state.trailing_stop} ({risk_params['stop_loss']*100:.2f}%)")
+                        print(f"Take profit: {state.dynamic_take_profit} ({risk_params['take_profit']*100:.2f}%)")
                         
                 elif signal == 'SELL' and state.open_trades < MAX_OPEN_TRADES:
-                    print("Sell signal detected!")
+                    print("Sell signal detected with strong confirmation!")
                     order = execute_order(SIDE_SELL, position_size)
                     if order:
                         state.position = 'SHORT'
                         state.entry_price = current_price
-                        state.trailing_stop = current_price * (1 + STOP_LOSS_PCT)
+                        # Use dynamic stop loss based on market conditions
+                        state.trailing_stop = current_price * (1 + risk_params['stop_loss'])
+                        state.dynamic_take_profit = current_price * (1 - risk_params['take_profit'])
+                        state.trailing_activation = risk_params['trailing_activation']
                         state.daily_trades += 1
                         state.open_trades += 1
+                        state.trade_start_time = datetime.now()
                         print(f"Entered SHORT position at {state.entry_price}")
+                        print(f"Stop loss: {state.trailing_stop} ({risk_params['stop_loss']*100:.2f}%)")
+                        print(f"Take profit: {state.dynamic_take_profit} ({risk_params['take_profit']*100:.2f}%)")
             
             # Position management
             if state.position:
@@ -315,45 +461,89 @@ def main():
                        else (state.entry_price - current_price) / state.entry_price)
                 print(f"Current P&L: {pnl*100:.2f}%")
                 
-                # Update trailing stop if in profit
-                if pnl > 0:
+                # Check market trend shift - exit early if trend changes against position
+                trend_shifted = False
+                if state.position == 'LONG' and not trend_info['is_uptrend'] and pnl > 0:
+                    print("Trend shifted against LONG position. Considering early exit.")
+                    trend_shifted = True
+                elif state.position == 'SHORT' and trend_info['is_uptrend'] and pnl > 0:
+                    print("Trend shifted against SHORT position. Considering early exit.")
+                    trend_shifted = True
+                
+                # Update trailing stop if in profit beyond activation threshold
+                if pnl > state.trailing_activation:
                     if state.position == 'LONG':
                         new_stop = current_price * (1 - TRAILING_STOP_PCT)
                         state.trailing_stop = max(state.trailing_stop, new_stop)
+                        print(f"Updated trailing stop: {state.trailing_stop}")
                     else:  # SHORT
                         new_stop = current_price * (1 + TRAILING_STOP_PCT)
                         state.trailing_stop = min(state.trailing_stop, new_stop)
+                        print(f"Updated trailing stop: {state.trailing_stop}")
                 
                 # Check exit conditions
                 exit_position = False
                 exit_reason = ""
+                is_win = False
                 
                 if state.position == 'LONG':
+                    # Stop loss hit
                     if current_price <= state.trailing_stop:
                         exit_reason = "Trailing Stop"
                         exit_position = True
-                    elif pnl >= TAKE_PROFIT_PCT:
+                        is_win = False
+                    # Take profit hit
+                    elif current_price >= state.dynamic_take_profit:
                         exit_reason = "Take Profit"
                         exit_position = True
+                        is_win = True
+                    # Trend shift exit - partial take profit
+                    elif trend_shifted and pnl > risk_params['stop_loss']/2:
+                        exit_reason = "Trend Shift"
+                        exit_position = True
+                        is_win = pnl > 0
                 else:  # SHORT
+                    # Stop loss hit
                     if current_price >= state.trailing_stop:
                         exit_reason = "Trailing Stop"
                         exit_position = True
-                    elif pnl >= TAKE_PROFIT_PCT:
+                        is_win = False
+                    # Take profit hit
+                    elif current_price <= state.dynamic_take_profit:
                         exit_reason = "Take Profit"
                         exit_position = True
+                        is_win = True
+                    # Trend shift exit - partial take profit
+                    elif trend_shifted and pnl > risk_params['stop_loss']/2:
+                        exit_reason = "Trend Shift"
+                        exit_position = True
+                        is_win = pnl > 0
                 
                 if exit_position:
                     print(f"Exit signal: {exit_reason}")
                     side = SIDE_SELL if state.position == 'LONG' else SIDE_BUY
-                    order = execute_order(side, POSITION_SIZE)
+                    order = execute_order(side, position_size)
                     if order:
                         state.daily_pl += pnl
                         state.open_trades -= 1
+                        
+                        # Update win/loss streaks for adaptive position sizing
+                        total_trades += 1
+                        if is_win:
+                            winning_trades += 1
+                            win_streak += 1
+                            loss_streak = 0
+                        else:
+                            win_streak = 0
+                            loss_streak += 1
+                        
                         print(f"Closed {state.position} position, P&L: {pnl*100:.2f}%")
+                        print(f"Win rate: {winning_trades}/{total_trades} ({winning_trades/total_trades*100:.2f}%)")
+                        
                         state.position = None
                         state.entry_price = 0
                         state.trailing_stop = 0
+                        state.dynamic_take_profit = 0
                 
                 # Check daily drawdown limit
                 if state.daily_pl <= -MAX_DAILY_DRAWDOWN:
